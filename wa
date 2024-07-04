@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+
+'''
+=========WhatsAppGDExtract.py=========
+
+
+GitHub:https://github.com/YuriCosta/WhatsApp-GD-Extractor-Multithread
+
+'''
+
+from base64 import b64decode
+from getpass import getpass
+from multiprocessing.pool import ThreadPool
+from textwrap import dedent
+import hashlib
+import json
+import os
+import sys
+import argparse
+import logging
+
+def human_size(size):
+    for s in ["B", "kiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"]:
+        if abs(size) < 1024:
+            break
+        size = int(size / 1024)
+    return "{}{}".format(size, s)
+
+def have_file(file, size, md5):
+    if not os.path.exists(file) or size != os.path.getsize(file):
+        return False
+
+    digest = hashlib.md5()
+    with open(file, "br") as input:
+        while True:
+            b = input.read(8 * 1024)
+            if not b:
+                break
+            digest.update(b)
+
+    return md5 == digest.digest()
+
+def download_file(file, stream):
+    os.makedirs(os.path.dirname(file), exist_ok=True)
+    with open(file, "bw") as dest:
+        for chunk in stream.iter_content(chunk_size=None):
+            dest.write(chunk)
+
+class WaBackup:
+    def __init__(self, root_dir):
+        self.root_dir = root_dir
+
+    def list_path(self, path):
+        for root, _, files in os.walk(path):
+            for file in files:
+                yield os.path.join(root, file)
+
+    def backups(self):
+        return [self.root_dir]
+
+    def backup_files(self, backup):
+        return self.list_path(backup)
+
+    def fetch(self, file):
+        _path_to_dir = os.path.dirname(os.path.abspath(__file__)) + "/output/"
+        name = _path_to_dir + os.path.sep.join(file.split(os.path.sep)[3:])
+        md5Hash = hashlib.md5()
+        with open(file, 'rb') as f:
+            while chunk := f.read(8192):
+                md5Hash.update(chunk)
+        md5Hash = md5Hash.digest()
+
+        if not have_file(name, os.path.getsize(file), md5Hash):
+            os.makedirs(os.path.dirname(name), exist_ok=True)
+            with open(name, 'wb') as dest:
+                with open(file, 'rb') as src:
+                    for chunk in iter(lambda: src.read(4096), b""):
+                        dest.write(chunk)
+
+        return name, os.path.getsize(file), md5Hash
+
+    def fetch_all(self, backup, cksums):
+        num_files = 0
+        total_size = 0
+        with ThreadPool(10) as pool:
+            downloads = pool.imap_unordered(
+                lambda file: self.fetch(file),
+                self.backup_files(backup)
+            )
+            for name, size, md5Hash in downloads:
+                num_files += 1
+                total_size += size
+                logging.info(
+                    "\rProgress: {:7.3f}% {:60}".format(
+                        100 * total_size / total_size,
+                        os.path.basename(name)[-60:]
+                    ),
+                )
+
+                cksums.write("{md5Hash} *{name}\n".format(
+                    name=name,
+                    md5Hash=md5Hash.hex(),
+                ))
+
+        logging.info("{} files ({})\n".format(num_files, human_size(total_size)))
+
+def createSettingsFile():
+    with open('settings.cfg', 'w') as cfg:
+        cfg.write(dedent("""
+            [auth]
+            root_dir = /storage/emulated/0/Download/TeraBox/Download/From: M2101K6G/media/com.whatsapp
+            """).lstrip())
+
+def backup_info(backup):
+    metadata = json.loads(backup["metadata"])
+    for size in "backupSize", "chatdbSize", "mediaSize", "videoSize":
+        metadata[size] = human_size(int(metadata[size]))
+    return dedent("""
+        Backup {name} ({backupSize}):
+            WhatsApp version: {versionOfAppWhenBackup}
+            Password protected: {passwordProtectedBackupEnabled}
+            Messages: {numOfMessages} ({chatdbSize})
+            Media files: {numOfMediaFiles} ({mediaSize})
+            Photos: {numOfPhotos}
+            Videos: included={includeVideosInBackup} ({videoSize})
+        """.format(
+            name=backup["name"].split("/")[-1],
+            **metadata
+        )
+    )
+
+def getConfigs(args):
+    root_dir = args.root_dir
+    return {
+        "root_dir": root_dir
+    }
+
+def localBackupExtractor(root_dir):
+    wa_backup = WaBackup(root_dir)
+    backups = wa_backup.backups()
+
+    with open("md5sum.txt", "w", encoding="utf-8", buffering=1) as cksums:
+        for backup in backups:
+            wa_backup.fetch_all(backup, cksums)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract WhatsApp backups from local storage.")
+    parser.add_argument("--root_dir", required=True, help="The root directory to search for backups.")
+    args = parser.parse_args()
+
+    configs = getConfigs(args)
+    root_dir = configs['root_dir']
+
+    localBackupExtractor(root_dir)
